@@ -8,5 +8,6 @@ APIで非同期にアクセスするから、でかいリポジトリをcloneし
 
 # Usage
 ```
-$ cargo run -- --help
+$ cargo run -- https://github.com/<owner>/<repo> /path/to/directory
 ```
+You can see help for parameters with `--help`.
