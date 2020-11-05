@@ -8,6 +8,13 @@ APIで非同期にアクセスするから、でかいリポジトリをcloneし
 
 # Usage
 ```
-$ cargo run -- https://github.com/<owner>/<repo> /path/to/directory
+# install
+$ cargo install --git https://github.com/White-Green/ghfs --branch main
+
+# mount
+$ ghfs https://github.com/<owner>/<repo> /path/to/directory
+
+# unmount
+$ fusermount -u /path/to/directory
 ```
 You can see help for parameters with `--help`.
