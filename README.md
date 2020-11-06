@@ -4,7 +4,7 @@ APIで非同期にアクセスするから、でかいリポジトリをcloneし
 
 # Require
 - OS:Linux(macでも動くかも(Dokanyにも対応したいね))
-- FUSE
+- libfuse-dev and libssl-dev are required in Ubuntu.
 
 # Usage
 ```
