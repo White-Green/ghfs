@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use clap::{App, Arg};
+use clap::{App, Arg, SubCommand};
 use regex::Regex;
 use reqwest::blocking::Client;
 
@@ -40,7 +40,25 @@ fn main() {
             .help("path to directory for mount")
             .takes_value(true)
             .required(true))
+        .subcommand(SubCommand::with_name("token")
+            .help("manage personal access token")
+            .subcommand(SubCommand::with_name("set")
+                .arg(Arg::with_name("token")
+                    .help("personal access token")
+                    .takes_value(true)
+                    .required(true)))
+            .subcommand(SubCommand::with_name("remove")))
         .get_matches();
+
+    if let Some(token_arg) = matches.subcommand_matches("token") {
+        if let Some(token_set_arg) = token_arg.subcommand_matches("set") {
+            // command [ghfs token set]
+        } else if let Some(token_remove_arg) = token_arg.subcommand_matches("remove") {
+            // command [ghfs token remove]
+        } else {
+            // command [ghfs token]
+        }
+    }
 
     print!("GitHub Username: ");
     std::io::stdout().flush().unwrap();
