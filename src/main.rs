@@ -6,6 +6,8 @@ use reqwest::blocking::Client;
 
 use crate::github_filesystem::http::json_request;
 use crate::github_filesystem::mount;
+use users::get_current_uid;
+use std::fs::Permissions;
 
 mod github_filesystem;
 
@@ -51,10 +53,18 @@ fn main() {
         .get_matches();
 
     if let Some(token_arg) = matches.subcommand_matches("token") {
+        let uid = get_current_uid();
+        let path = format!("./{}", uid);
         if let Some(token_set_arg) = token_arg.subcommand_matches("set") {
             // command [ghfs token set]
+            std::fs::write(&path, token_set_arg.value_of("token").unwrap())
+                .expect("write failed.");
+            let permission = <Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600);
+            std::fs::set_permissions(&path, permission)
+                .expect("chmod failed");
         } else if let Some(token_remove_arg) = token_arg.subcommand_matches("remove") {
             // command [ghfs token remove]
+            std::fs::remove_file(&path);
         } else {
             // command [ghfs token]
         }
