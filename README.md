@@ -12,7 +12,7 @@ APIで非同期にアクセスするから、でかいリポジトリをcloneし
 $ cargo install --git https://github.com/White-Green/ghfs --branch main
 
 # mount
-$ ghfs https://github.com/<owner>/<repo> /path/to/directory
+$ ghfs mount https://github.com/<owner>/<repo> /path/to/directory
 
 # unmount
 $ fusermount -u /path/to/directory
