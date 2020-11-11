@@ -11,6 +11,12 @@ APIで非同期にアクセスするから、でかいリポジトリをcloneし
 # install
 $ cargo install --git https://github.com/White-Green/ghfs --branch main
 
+# register Personal Access Token
+$ ghfs token set
+
+# remove Personal Access Token registered
+$ ghfs token remove
+
 # mount
 $ ghfs mount https://github.com/<owner>/<repo> /path/to/directory
 
