@@ -1,3 +1,4 @@
+use std::convert::TryFrom;
 use std::fs::Permissions;
 use std::io::{Error, Write};
 use std::path::Path;
@@ -5,7 +6,7 @@ use std::path::Path;
 use clap::{App, Arg, ArgMatches, SubCommand};
 use regex::Regex;
 use reqwest::blocking::Client;
-use users::get_current_uid;
+use users::{get_current_uid, get_current_username};
 
 use crate::github_filesystem::http::json_request;
 use crate::github_filesystem::mount;
@@ -78,8 +79,9 @@ fn main() {
             return;
         }
     };
-    println!("url:{}", url);
+
     let path = matches.value_of("PATH").unwrap();
+    std::fs::create_dir_all(path);
     mount(&url, client, &path, username, pass);
 }
 
@@ -113,12 +115,17 @@ fn token_subcommand(token_arg: &ArgMatches) {
         let username = username.trim().to_string();
         let pass = rpassword::prompt_password_stdout("Token: ").unwrap();
 
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .create(<str as AsRef<Path>>::as_ref(&path).parent().unwrap())
+            .expect("Failed to create directories.");
+
         std::fs::write(&path, format!("{}\n{}\n", username, pass))
-            .expect("write failed.");
+            .expect("Failed to write token.");
 
         let permission = <Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600);
         std::fs::set_permissions(&path, permission)
-            .expect("chmod failed");
+            .expect("Failed to chmod.");
     } else if let Some(_) = token_arg.subcommand_matches("remove") {
         // command [ghfs token remove]
         std::fs::remove_file(&path);
@@ -133,6 +140,6 @@ fn token_subcommand(token_arg: &ArgMatches) {
 }
 
 fn get_token_file_path() -> String {
-    let uid = get_current_uid();
-    format!("./{}", uid)
+    let username = get_current_username().unwrap();
+    format!("/home/{}/.config/ghfs/token", username.to_str().unwrap())
 }
