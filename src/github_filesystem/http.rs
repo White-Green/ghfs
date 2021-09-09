@@ -20,7 +20,7 @@ impl HTTPWrapper {
     pub(crate) async fn request<T: DeserializeOwned + Debug>(&self, url: &str) -> Result<T, reqwest::Error> {
         let instant = Instant::now();
         let result = self.client.get(url).header("User-Agent", APP_NAME).basic_auth(&self.username, Some(&self.password)).send().await?.json().await;
-        println!("request for {} latency: {} μs", url, instant.elapsed().as_micros());
+        log::debug!("request for {} latency: {} μs", url, instant.elapsed().as_micros());
         result
     }
 }
