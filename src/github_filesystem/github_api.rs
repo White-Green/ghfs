@@ -35,7 +35,7 @@ impl Error for GitHubApiRootConstructError {}
 
 impl GitHubApiRoot {
     pub(crate) fn from_repository_url(url: &str) -> Result<Self, GitHubApiRootConstructError> {
-        let regex = Regex::new("^(https://github\\.com/)?(?P<owner>[^/]+)/(?P<repo>[^/]+)(\\?(branch=(?P<branch>.+)|rev=(?P<rev>.+))?)?$").unwrap();
+        let regex = Regex::new("^(https://github\\.com/)?(?P<owner>[^/]+)/(?P<repo>[^/?]+)(\\?(branch=(?P<branch>.+)|rev=(?P<rev>.+))?)?$").unwrap();
         let captures = regex.captures(url).ok_or_else(|| GitHubApiRootConstructError::InvalidUrl(url.to_string()))?;
         let result = GitHubApiRoot {
             owner: captures.name("owner").unwrap().as_str().to_string(),
@@ -65,8 +65,8 @@ impl GitHubApiRoot {
                 Ok(Tree { path: "".to_string(), url: branch.into_tree_url() })
             }
             GitHubApiRoot { owner, repo, branch_name: Option::None, rev: Some(rev) } => {
-                let commit = http.request::<Commit>(&format!("https://api.github.com/repos/{}/{}/commits/{}", owner, repo, rev)).await?;
-                Ok(Tree { path: "".to_string(), url: commit.tree.url })
+                let commit = http.request::<BranchCommit>(&format!("https://api.github.com/repos/{}/{}/commits/{}", owner, repo, rev)).await?;
+                Ok(Tree { path: "".to_string(), url: commit.commit.tree.url })
             }
             GitHubApiRoot { branch_name: Some(_), rev: Some(_), .. } => unreachable!(),
         }

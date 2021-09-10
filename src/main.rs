@@ -19,7 +19,7 @@ fn main() -> anyhow::Result<()> {
         .subcommand(
             SubCommand::with_name("mount")
                 .about("Mount a repository.")
-                .arg(Arg::with_name("URL").help("github repository URL").takes_value(true).required(true))
+                .arg(Arg::with_name("URL").help("github repository e.g. https://github.com/White-Green/ghfs,\nWhite-Green/ghfs,\nWhite-Green/ghfs?branch=main,\nhttps://github.com/White-Green/ghfs?rev=3639d3315140fea4844df82de71de18f6081c3cc").takes_value(true).required(true))
                 .arg(Arg::with_name("PATH").help("path to directory for mount").takes_value(true).required(true)),
         )
         .get_matches();
