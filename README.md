@@ -17,10 +17,10 @@ $ ghfs token set
 # remove Personal Access Token registered
 $ ghfs token remove
 
-# mount
+# mount (Press Ctrl+C to unmount)
 $ ghfs mount https://github.com/<owner>/<repo> /path/to/directory
 
-# unmount
+# unmount (Required only if the ghfs process is killed)
 $ fusermount -u /path/to/directory
 ```
 You can see help for parameters with `--help`.
