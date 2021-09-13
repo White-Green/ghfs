@@ -46,7 +46,7 @@ impl GitHubApiRoot {
         assert!(result.branch_name.is_none() || result.rev.is_none());
         if let Some(rev) = &result.rev {
             let rev_regex = Regex::new("^[0-9a-f]{40}$").unwrap();
-            if !rev_regex.is_match(&rev) {
+            if !rev_regex.is_match(rev) {
                 return Err(GitHubApiRootConstructError::InvalidRev(rev.clone()));
             }
         }

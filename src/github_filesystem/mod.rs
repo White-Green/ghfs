@@ -2,20 +2,24 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::os::raw::c_int;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, atomic};
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::RwLock as std_RwLock;
+use std::sync::{atomic, Arc};
 
-use fuse::{FileAttr, Filesystem, FileType, ReplyAttr, ReplyBmap, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request};
+use fuse::{FileAttr, FileType, Filesystem, ReplyAttr, ReplyBmap, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request};
 use libc::ENOSYS;
 use log::info;
+use lru_cache::{CacheBackend, LRUCache};
 use time::Timespec;
-use tokio::sync::{mpsc, OwnedRwLockWriteGuard, RwLock};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::{mpsc, OwnedRwLockWriteGuard, RwLock};
 use tokio::task::JoinHandle;
+use users::get_current_username;
+use uuid::Uuid;
 
 use crate::github_filesystem::github_api::{GetBlobContentError, GitHubApiRoot, TreeItem};
 use crate::github_filesystem::http::HTTPWrapper;
+use std::{fs, mem};
 
 pub(crate) mod github_api;
 pub(crate) mod http;
@@ -40,29 +44,74 @@ async fn operation_handler(mut receiver: UnboundedReceiver<Message>, http: HTTPW
     let mut children = HashMap::new();
     children.insert(1, HashSet::new());
 
-    let resources = Arc::new(RwLock::new((files, children)));
+    let resources = Arc::new(RwLock::new(FileSystemData::new(files, children)));
     let inode_max = Arc::new(AtomicU64::new(2));
     while let Some(message) = receiver.recv().await {
         let resources = Arc::clone(&resources);
         let inode_max = Arc::clone(&inode_max);
         let http = Arc::clone(&http);
         tokio::spawn(async move {
+            log::debug!("{:?}", message);
             message_handler_inner(message, resources, inode_max, http).await.expect("");
         });
     }
     Ok(())
 }
 
-async fn message_handler_inner(message: Message, resources: Arc<RwLock<(HashMap<u64, FileData>, HashMap<u64, HashSet<u64>>)>>, inode_max: Arc<AtomicU64>, http: Arc<HTTPWrapper>) -> anyhow::Result<()> {
+struct FileSystemDataBackend {
+    directory_base: PathBuf,
+}
+
+impl CacheBackend for FileSystemDataBackend {
+    type Index = Uuid;
+    type Item = Vec<u8>;
+
+    fn load_from_backend(&mut self, index: &Self::Index) -> Option<Self::Item> {
+        let path = self.directory_base.join(format!("{}", index));
+        fs::read(path).ok()
+    }
+
+    fn write_back(&mut self, index: Self::Index, item: Self::Item, updated: bool) {
+        if updated {
+            let path = self.directory_base.join(format!("{}", index));
+            fs::write(path, item).expect("failed to write cache file.");
+        }
+    }
+
+    fn get_weight(&mut self, _index: &Self::Index, item: &Self::Item) -> usize {
+        item.len()
+    }
+}
+
+struct FileSystemData {
+    files: HashMap<u64, FileData>,
+    children: HashMap<u64, HashSet<u64>>,
+    file_cache: LRUCache<FileSystemDataBackend>,
+}
+
+impl FileSystemData {
+    fn new(files: HashMap<u64, FileData>, children: HashMap<u64, HashSet<u64>>) -> Self {
+        let username = get_current_username().unwrap();
+        let directory_base = <String as AsRef<Path>>::as_ref(&format!("/home/{}/.cache/ghfs", username.to_str().unwrap())).join(Uuid::new_v4().to_string());
+        fs::create_dir_all(dbg!(&directory_base)).expect("failed to create cache directory");
+        FileSystemData {
+            files,
+            children,
+            file_cache: LRUCache::with_capacity(FileSystemDataBackend { directory_base }, 1 << 20),
+        }
+    }
+}
+
+async fn message_handler_inner(message: Message, resources: Arc<RwLock<FileSystemData>>, inode_max: Arc<AtomicU64>, http: Arc<HTTPWrapper>) -> anyhow::Result<()> {
     let Message { unique: _, uid, gid, pid: _, operation } = message;
     match operation {
         Operation::Lookup { parent, name, reply } => {
             if parent == 1 && name == ".." {
-                reply.entry(&Timespec::new(1, 0), &resources.read().await.0[&1].attr(), 0);
+                reply.entry(&Timespec::new(1, 0), &resources.read().await.files[&1].attr(), 0);
             } else {
                 let resources = resources.write_owned().await;
                 let mut resources = load_directory(resources, inode_max, parent, uid, gid, http).await?;
-                let (files, children) = &mut *resources;
+                let FileSystemData { files, children, file_cache: _ } = &mut *resources;
                 let option = children.get(&parent).into_iter().flatten().filter_map(|inode| files.get(inode)).find(|file| file.name == name);
                 if let Some(file) = option {
                     file.lookup_count.fetch_add(1, atomic::Ordering::Relaxed);
@@ -74,7 +123,7 @@ async fn message_handler_inner(message: Message, resources: Arc<RwLock<(HashMap<
         }
         Operation::Forget { ino: _, nlookup: _ } => {}
         Operation::Getattr { ino, reply } => {
-            let (files, _children) = &*resources.read().await;
+            let FileSystemData { files, children: _, file_cache: _ } = &*resources.read().await;
             if let Some(file) = files.get(&ino) {
                 reply.attr(&Timespec::new(1, 0), &file.attr());
             } else {
@@ -96,7 +145,7 @@ async fn message_handler_inner(message: Message, resources: Arc<RwLock<(HashMap<
             flags,
             reply,
         } => {
-            let (files, _children) = &mut *resources.write().await;
+            let FileSystemData { files, children: _, file_cache } = &mut *resources.write().await;
             //TODO:permission
             if let Some(file) = files.get_mut(&ino) {
                 let time = time::now().to_timespec();
@@ -111,13 +160,11 @@ async fn message_handler_inner(message: Message, resources: Arc<RwLock<(HashMap<
                 }
                 if let Some(n) = size {
                     if n != file.attr.size {
-                        match &mut file.data {
-                            GitHubFileData::Raw(vec) => {
-                                file.attr.size = n;
-                                vec.resize(n as usize, 0);
-                                file.attr.update_mtime(time);
-                            }
-                            _ => {}
+                        if let GitHubFileData::Raw(uuid) = &file.data {
+                            let vec = file_cache.get_mut(uuid).unwrap();
+                            file.attr.size = n;
+                            vec.resize(n as usize, 0);
+                            file.attr.update_mtime(time);
                         }
                     }
                 };
@@ -146,7 +193,7 @@ async fn message_handler_inner(message: Message, resources: Arc<RwLock<(HashMap<
             reply.error(ENOSYS);
         }
         Operation::Mkdir { parent, name, mode: _, reply } => {
-            let (files, children) = &mut *resources.write().await;
+            let FileSystemData { files, children, file_cache: _ } = &mut *resources.write().await;
             let ino = inode_max.fetch_add(1, atomic::Ordering::AcqRel);
             let file = create_directory(ino, parent, uid, gid, name.to_os_string());
             reply.entry(&Timespec::new(1, 0), &file.attr(), 0);
@@ -160,13 +207,13 @@ async fn message_handler_inner(message: Message, resources: Arc<RwLock<(HashMap<
         }
         Operation::Unlink { parent, name, reply } => {
             //TODO:permission
-            let (files, children) = &mut *resources.write().await;
+            let FileSystemData { files, children, file_cache: _ } = &mut *resources.write().await;
             let option = children.get(&parent).into_iter().flatten().filter_map(|ino| files.get(ino)).find(|file| file.name == name);
             if let Some(FileData {
-                            data: GitHubFileData::Raw(_) | GitHubFileData::None,
-                            attr: EditableFileAttr { ino, kind: FileType::RegularFile, .. },
-                            ..
-                        }) = option
+                data: GitHubFileData::Raw(_) | GitHubFileData::None,
+                attr: EditableFileAttr { ino, kind: FileType::RegularFile, .. },
+                ..
+            }) = option
             {
                 let ino = *ino;
                 files.remove(&ino);
@@ -182,13 +229,13 @@ async fn message_handler_inner(message: Message, resources: Arc<RwLock<(HashMap<
         }
         Operation::Rmdir { parent, name, reply } => {
             //TODO:permission
-            let (files, children) = &mut *resources.write().await;
+            let FileSystemData { files, children, file_cache: _ } = &mut *resources.write().await;
             let option = children.get(&parent).into_iter().flatten().filter_map(|ino| files.get(ino)).find(|file| file.name == name);
             if let Some(FileData {
-                            data: GitHubFileData::None,
-                            attr: EditableFileAttr { ino, kind: FileType::Directory, .. },
-                            ..
-                        }) = option
+                data: GitHubFileData::None,
+                attr: EditableFileAttr { ino, kind: FileType::Directory, .. },
+                ..
+            }) = option
             {
                 let ino = *ino;
                 files.remove(&ino);
@@ -207,13 +254,13 @@ async fn message_handler_inner(message: Message, resources: Arc<RwLock<(HashMap<
         }
         Operation::Rename { parent, name, newparent, newname, reply } => {
             //TODO:permission
-            let (files, children) = &mut *resources.write().await;
+            let FileSystemData { files, children, file_cache: _ } = &mut *resources.write().await;
             let option = children.get(&parent).into_iter().flatten().filter_map(|ino| files.get(ino)).find(|file| file.name == name);
             if let Some(FileData {
-                            data: GitHubFileData::Raw(_) | GitHubFileData::None,
-                            attr: EditableFileAttr { ino, .. },
-                            ..
-                        }) = option
+                data: GitHubFileData::Raw(_) | GitHubFileData::None,
+                attr: EditableFileAttr { ino, .. },
+                ..
+            }) = option
             {
                 let ino = *ino;
                 let time = time::now().to_timespec();
@@ -248,17 +295,20 @@ async fn message_handler_inner(message: Message, resources: Arc<RwLock<(HashMap<
             //TODO:permission
             let offset = offset as usize;
             let size = size as usize;
-            let (files, _children) = &mut *resources.write().await;
+            let FileSystemData { files, children: _, file_cache } = &mut *resources.write().await;
             if let Some(file) = files.get_mut(&ino) {
                 if let data @ GitHubFileData::FetchingGitHubFile(_) = &mut file.data {
-                    if let GitHubFileData::FetchingGitHubFile(handle) = std::mem::replace(data, GitHubFileData::None) {
-                        *data = GitHubFileData::Raw(handle.await??);
+                    if let GitHubFileData::FetchingGitHubFile(handle) = mem::replace(data, GitHubFileData::None) {
+                        let uuid = Uuid::new_v4();
+                        *data = GitHubFileData::Raw(uuid);
+                        file_cache.insert(uuid, handle.await??);
                     } else {
                         unreachable!()
                     }
                 }
 
                 if let GitHubFileData::Raw(data) = &file.data {
+                    let data = file_cache.get(data).unwrap();
                     if offset < data.len() {
                         reply.data(&data[offset..(offset + size).min(data.len())]);
                     } else {
@@ -273,11 +323,13 @@ async fn message_handler_inner(message: Message, resources: Arc<RwLock<(HashMap<
         }
         Operation::Write { ino, fh: _, offset, data, flags: _, reply } => {
             //TODO:permission
-            let (files, _children) = &mut *resources.write().await;
+            let FileSystemData { files, children: _, file_cache } = &mut *resources.write().await;
             if let Some(file) = files.get_mut(&ino) {
                 if let data @ GitHubFileData::FetchingGitHubFile(_) = &mut file.data {
-                    if let GitHubFileData::FetchingGitHubFile(handle) = std::mem::replace(data, GitHubFileData::None) {
-                        *data = GitHubFileData::Raw(handle.await??);
+                    if let GitHubFileData::FetchingGitHubFile(handle) = mem::replace(data, GitHubFileData::None) {
+                        let uuid = Uuid::new_v4();
+                        *data = GitHubFileData::Raw(uuid);
+                        file_cache.insert(uuid, handle.await??);
                     } else {
                         unreachable!()
                     }
@@ -295,6 +347,7 @@ async fn message_handler_inner(message: Message, resources: Arc<RwLock<(HashMap<
                     let time = time::now().to_timespec();
                     attr.update_mtime(time);
                     attr.update_ctime(time);
+                    let file = file_cache.get_mut(file).unwrap();
                     if file.len() < offset as usize + data.len() {
                         file.resize(offset as usize + data.len(), 0);
                         attr.size = file.len() as u64;
@@ -327,7 +380,7 @@ async fn message_handler_inner(message: Message, resources: Arc<RwLock<(HashMap<
         Operation::Readdir { ino, fh: _, offset, mut reply } => {
             let resources = resources.write_owned().await;
             let mut resources = load_directory(resources, inode_max, ino, uid, gid, http).await?;
-            let (files, children) = &mut *resources;
+            let FileSystemData { files, children, file_cache: _ } = &mut *resources;
             let offset = offset as usize;
             let current = OsString::from(".");
             let parent = OsString::from("..");
@@ -337,7 +390,7 @@ async fn message_handler_inner(message: Message, resources: Arc<RwLock<(HashMap<
             }
             let iter = files
                 .get(&ino)
-                .map_or(Vec::new(), |file| vec![Some((&file.attr, &current)), if ino == 1 { Some((&file.attr, &parent)) } else { files.get(&file.parent).map_or(None, |file| Some((&file.attr, &parent))) }])
+                .map_or(Vec::new(), |file| vec![Some((&file.attr, &current)), if ino == 1 { Some((&file.attr, &parent)) } else { files.get(&file.parent).map(|file| (&file.attr, &parent)) }])
                 .into_iter()
                 .flatten()
                 .chain(children.get(&ino).into_iter().flatten().filter_map(|ino| files.get(ino).map(|file| (&file.attr, &file.name))));
@@ -378,9 +431,9 @@ async fn message_handler_inner(message: Message, resources: Arc<RwLock<(HashMap<
         }
         Operation::Create { parent, name, mode: _, flags, reply } => {
             //TODO:permission
-            let (files, children) = &mut *resources.write().await;
+            let FileSystemData { files, children, file_cache } = &mut *resources.write().await;
             let ino = inode_max.fetch_add(1, atomic::Ordering::AcqRel);
-            let file = create_empty_file(ino, parent, uid, gid, name.to_os_string());
+            let file = create_empty_file(ino, parent, uid, gid, name.to_os_string(), file_cache);
             reply.created(&Timespec::new(1, 0), &file.attr(), 0, 0, flags);
             assert!(files.insert(ino, file).is_none());
             if let Some(parent) = files.get_mut(&parent) {
@@ -413,11 +466,11 @@ async fn message_handler_inner(message: Message, resources: Arc<RwLock<(HashMap<
     Ok(())
 }
 
-async fn load_directory(mut resources: OwnedRwLockWriteGuard<(HashMap<u64, FileData>, HashMap<u64, HashSet<u64>>)>, inode_max: Arc<AtomicU64>, directory: u64, uid: u32, gid: u32, http: Arc<HTTPWrapper>) -> anyhow::Result<OwnedRwLockWriteGuard<(HashMap<u64, FileData>, HashMap<u64, HashSet<u64>>)>> {
-    let (files, children) = &mut *resources;
-    let file = files.get_mut(&directory).ok_or(anyhow::Error::msg(""))?;
+async fn load_directory(mut resources: OwnedRwLockWriteGuard<FileSystemData>, inode_max: Arc<AtomicU64>, directory: u64, uid: u32, gid: u32, http: Arc<HTTPWrapper>) -> anyhow::Result<OwnedRwLockWriteGuard<FileSystemData>> {
+    let FileSystemData { files, children, file_cache: _ } = &mut *resources;
+    let file = files.get_mut(&directory).ok_or_else(|| anyhow::Error::msg(""))?;
     if let GitHubFileData::FetchingGitHubDirectory(_) = &mut file.data {
-        if let GitHubFileData::FetchingGitHubDirectory(handle) = std::mem::replace(&mut file.data, GitHubFileData::None) {
+        if let GitHubFileData::FetchingGitHubDirectory(handle) = mem::replace(&mut file.data, GitHubFileData::None) {
             let directory_children = handle.await??;
             for item in directory_children {
                 let ino = inode_max.fetch_add(1, atomic::Ordering::AcqRel);
@@ -438,7 +491,9 @@ async fn load_directory(mut resources: OwnedRwLockWriteGuard<(HashMap<u64, FileD
     Ok(resources)
 }
 
-fn create_empty_file(ino: u64, parent: u64, uid: u32, gid: u32, name: OsString) -> FileData {
+fn create_empty_file(ino: u64, parent: u64, uid: u32, gid: u32, name: OsString, cache: &mut LRUCache<FileSystemDataBackend>) -> FileData {
+    let uuid = Uuid::new_v4();
+    cache.insert(uuid, Vec::new());
     let t = time::now().to_timespec();
     FileData {
         parent,
@@ -459,7 +514,7 @@ fn create_empty_file(ino: u64, parent: u64, uid: u32, gid: u32, name: OsString) 
             flags: 0,
         },
         name,
-        data: GitHubFileData::Raw(Vec::new()),
+        data: GitHubFileData::Raw(uuid),
         lookup_count: AtomicUsize::new(0),
         removed: false,
     }
@@ -548,7 +603,7 @@ fn create_github_directory(ino: u64, parent: u64, uid: u32, gid: u32, name: OsSt
 
 #[derive(Debug)]
 enum GitHubFileData {
-    Raw(Vec<u8>),
+    Raw(Uuid),
     FetchingGitHubFile(JoinHandle<Result<Vec<u8>, GetBlobContentError>>),
     FetchingGitHubDirectory(JoinHandle<Result<Vec<TreeItem>, reqwest::Error>>),
     None,
@@ -652,86 +707,6 @@ struct GitHubFS {
 }
 
 const APP_NAME: &str = "ghfs";
-
-// impl GitHubFS {
-//     fn load_directory_if_not_loaded(&mut self, uid: u32, gid: u32, parent: u64) {
-//         if let Some(FileData { data: GitHubFileData::GitHubDirectory { url, fetched: false }, .. }) = self.files.get(&parent) {
-//             let url = url.clone();
-//             let files = self.load_child_files_from_github(&url, parent, uid, gid);
-//             if let Some(FileData { data: GitHubFileData::GitHubDirectory { fetched, .. }, .. }) = self.files.get_mut(&parent) {
-//                 *fetched = true;
-//             } else { unreachable!(); }
-//             for file in files {
-//                 self.insert_file(file, parent);
-//             }
-//         }
-//     }
-//     fn get_file_data(&mut self, ino: u64) -> Option<&Vec<u8>> {
-//         let file = match self.files.get(&ino) {
-//             None => return None,
-//             Some(file) => file,
-//         };
-//         match &file.data {
-//             GitHubFileData::GitHubFile { url } => {
-//                 if self.cache.contains(ino) {
-//                     self.cache.get_cache(ino)
-//                 } else {
-//                     Some(self.cache.insert_cache(ino, self.load_file_from_github(url)))
-//                 }
-//             }
-//             GitHubFileData::Raw(vec) => Some(vec),
-//             _ => { None }
-//         }
-//     }
-//     fn insert_file(&mut self, file: FileData, parent: u64) {
-//         if let Some(children) = self.children.get_mut(&parent) {
-//             children.insert(file.attr.ino);
-//         } else {
-//             let mut children = HashSet::with_capacity(1);
-//             children.insert(file.attr.ino);
-//             self.children.insert(parent, children);
-//         }
-//         self.files.insert(file.attr.ino, file);
-//     }
-//     fn get_json(&self, url: &str) -> Box<JFObject> {
-//         json_request(&self.client, url, &self.username, &self.password)
-//     }
-//     fn load_file_from_github(&self, url: &str) -> Vec<u8> {
-//         let json = self.get_json(url);
-//         base64::decode(&json["content"].unwrap_string().replace("\\n", "")).unwrap()
-//     }
-//     fn load_child_files_from_github(&mut self, url: &str, parent: u64, uid: u32, gid: u32) -> Vec<FileData> {
-//         let json = self.get_json(url);
-//         json["tree"].unwrap_vec().iter().map(|file| {
-//             match file["type"].unwrap_string().as_str() {
-//                 "blob" => {
-//                     create_github_file(
-//                         self.next_ino(),
-//                         *file["size"].unwrap_i64() as u64,
-//                         parent,
-//                         uid,
-//                         gid,
-//                         OsString::from(file["path"].unwrap_string()),
-//                         file["url"].unwrap_string().clone())
-//                 }
-//                 "tree" => {
-//                     create_github_directory(
-//                         self.next_ino(),
-//                         parent,
-//                         uid,
-//                         gid,
-//                         OsString::from(file["path"].unwrap_string()),
-//                         file["url"].unwrap_string().clone())
-//                 }
-//                 _ => unimplemented!()
-//             }
-//         }).collect()
-//     }
-//     fn next_ino(&mut self) -> u64 {
-//         self.inode_max += 1;
-//         self.inode_max
-//     }
-// }
 
 #[derive(Debug)]
 struct Message {
@@ -962,7 +937,7 @@ enum Operation {
     },
 }
 
-const SEND_ERROR_MESSAGE: &'static str = "";
+const SEND_ERROR_MESSAGE: &str = "";
 
 impl Filesystem for GitHubFS {
     fn init(&mut self, _req: &Request) -> Result<(), c_int> {
