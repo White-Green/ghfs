@@ -10,7 +10,8 @@ use crate::github_filesystem::mount;
 
 mod github_filesystem;
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     // env::set_var("RUST_LOG", "debug");
     env_logger::init();
 
@@ -39,7 +40,7 @@ fn main() -> anyhow::Result<()> {
             let url = arg.value_of("URL").unwrap();
             let path = arg.value_of("PATH").unwrap();
             std::fs::create_dir_all(path)?;
-            mount(url, path, &username, &pass)?;
+            mount(url, path, &username, &pass).await?;
         }
         _ => println!("{}", matches.usage()),
     }

@@ -24,3 +24,8 @@ reqwest = { version = "0.11.4", features = ["json", "serde_json"] }
 base64 = "0.13.0"
 clap = "2.33.3"
 users = "0.11.0"
+uuid = { version = "0.8.2", features = ["v4"] }
+lru_cache = { git = "https://github.com/White-Green/lru-cache", rev = "04cb9efab124d2d2baede957021654229e4751fd" }
+signal-hook = "0.3.10"
+signal-hook-tokio = { version = "0.3.0", features = ["futures-v0_3"] }
+futures = "0.3.17"

@@ -5,11 +5,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::RwLock as std_RwLock;
 use std::sync::{atomic, Arc};
+use std::{fs, mem};
 
 use fuse::{FileAttr, FileType, Filesystem, ReplyAttr, ReplyBmap, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request};
+use futures::stream::StreamExt;
 use libc::ENOSYS;
 use log::info;
 use lru_cache::{CacheBackend, LRUCache};
+use signal_hook::consts::*;
+use signal_hook_tokio::Signals;
 use time::Timespec;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{mpsc, OwnedRwLockWriteGuard, RwLock};
@@ -19,20 +23,29 @@ use uuid::Uuid;
 
 use crate::github_filesystem::github_api::{GetBlobContentError, GitHubApiRoot, TreeItem};
 use crate::github_filesystem::http::HTTPWrapper;
-use std::{fs, mem};
 
 pub(crate) mod github_api;
 pub(crate) mod http;
 
-pub(crate) fn mount(url: &str, mount_point: &str, username: &str, password: &str) -> anyhow::Result<()> {
+pub(crate) async fn mount(url: &str, mount_point: &str, username: &str, password: &str) -> anyhow::Result<()> {
     let (sender, receiver) = mpsc::unbounded_channel();
     let http = HTTPWrapper::new(reqwest::Client::new(), username, password);
     let api = GitHubApiRoot::from_repository_url(url)?;
-    let runtime = tokio::runtime::Runtime::new()?;
-    let guard = runtime.enter();
-    runtime.spawn(async move { operation_handler(receiver, http, api).await.expect("") });
-    fuse::mount(GitHubFS { sender }, &mount_point, &[]).expect("failed to mount()");
-    drop(guard);
+    let mount_handle = unsafe { fuse::spawn_mount(GitHubFS { sender }, &mount_point, &[]).expect("failed to mount()") };
+    let mut mount_handle = Some(mount_handle);
+    tokio::spawn(async move { operation_handler(receiver, http, api).await.expect("") });
+    let mut signals: Signals = Signals::new(&[SIGINT, SIGTERM])?;
+    let handle = signals.handle();
+    while let Some(signal) = signals.next().await {
+        match signal {
+            SIGINT | SIGTERM => {
+                drop(mount_handle.take());
+                break;
+            }
+            _ => unreachable!(),
+        }
+    }
+    handle.close();
     Ok(())
 }
 
