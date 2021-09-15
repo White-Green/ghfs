@@ -106,7 +106,7 @@ impl FileSystemData {
     fn new(files: HashMap<u64, FileData>, children: HashMap<u64, HashSet<u64>>) -> Self {
         let username = get_current_username().unwrap();
         let directory_base = <String as AsRef<Path>>::as_ref(&format!("/home/{}/.cache/ghfs", username.to_str().unwrap())).join(Uuid::new_v4().to_string());
-        fs::create_dir_all(dbg!(&directory_base)).expect("failed to create cache directory");
+        fs::create_dir_all(&directory_base).expect("failed to create cache directory");
         FileSystemData {
             files,
             children,
