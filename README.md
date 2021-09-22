@@ -9,7 +9,7 @@ APIで非同期にアクセスするから、でかいリポジトリをcloneし
 # Usage
 ```
 # install
-$ cargo install --git https://github.com/White-Green/ghfs --branch main
+$ cargo install --git https://github.com/White-Green/ghfs
 
 # register Personal Access Token
 $ ghfs token set
